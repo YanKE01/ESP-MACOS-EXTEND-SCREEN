@@ -135,6 +135,10 @@ final class VirtualDisplayModel: ObservableObject {
             usbStatus = streamer.statusSummary
         } else {
             usbStatus = streamer.lastError ?? "Failed to start USB stream."
+            if isScreenRecordingPermissionError(usbStatus) {
+                autoMode = false
+                status = "Grant Screen Recording permission, then quit and reopen the app."
+            }
         }
         syncRuntimeState()
     }
@@ -236,6 +240,10 @@ final class VirtualDisplayModel: ObservableObject {
             || error.contains("No Device")
             || error.contains("not responding")
             || error.contains("not open")
+    }
+
+    private func isScreenRecordingPermissionError(_ message: String) -> Bool {
+        message.contains("Screen Recording permission")
     }
 }
 

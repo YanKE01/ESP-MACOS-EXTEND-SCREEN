@@ -1,10 +1,12 @@
 #import "USBDisplayStreamer.h"
 
+#import <AppKit/AppKit.h>
 #import <ImageIO/ImageIO.h>
 #import <IOKit/IOCFPlugIn.h>
 #import <IOKit/IOKitLib.h>
 #import <IOKit/usb/IOUSBLib.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
+#import <stdarg.h>
 
 typedef struct __attribute__((packed)) {
     uint16_t crc16;
@@ -22,6 +24,15 @@ _Static_assert(sizeof(UDISPFrameHeader) == 16, "ESP udisp frame header must stay
 static const uint8_t UDISPTypeJPG = 3;
 static const NSUInteger USBWriteChunkSize = 16 * 1024;
 static void *USBDisplayStreamerQueueKey = &USBDisplayStreamerQueueKey;
+
+static void USBDisplayLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+static void USBDisplayLog(NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    NSLog(@"[ESP USB Display] %@", message);
+}
 
 @interface USBDisplayStreamer ()
 @property (nonatomic, readwrite) BOOL isConnected;
@@ -49,6 +60,7 @@ static void *USBDisplayStreamerQueueKey = &USBDisplayStreamerQueueKey;
     dispatch_queue_t _streamQueue;
     dispatch_source_t _streamTimer;
     BOOL _captureInFlight;
+    BOOL _screenCaptureAccessRequested;
 
     CGDirectDisplayID _displayID;
     uint16_t _width;
@@ -102,11 +114,13 @@ static void *USBDisplayStreamerQueueKey = &USBDisplayStreamerQueueKey;
         return YES;
     }
 
+    USBDisplayLog(@"Connecting to VID 0x%04X PID 0x%04X", vendorID, productID);
     self.lastError = nil;
     io_iterator_t deviceIterator = IO_OBJECT_NULL;
     IOReturn kr = [self createDeviceIteratorForVendorID:vendorID productID:productID iterator:&deviceIterator];
     if (kr != kIOReturnSuccess) {
         self.lastError = [self message:@"USB device match failed" result:kr];
+        USBDisplayLog(@"%@", self.lastError);
         return NO;
     }
 
@@ -126,6 +140,7 @@ static void *USBDisplayStreamerQueueKey = &USBDisplayStreamerQueueKey;
             self.lastError =
                 [NSString stringWithFormat:@"No USB device found for VID 0x%04X PID 0x%04X.", vendorID, productID];
         }
+        USBDisplayLog(@"%@", self.lastError);
         [self closeUSBInterfaces];
         return NO;
     }
@@ -137,10 +152,14 @@ static void *USBDisplayStreamerQueueKey = &USBDisplayStreamerQueueKey;
     self.connectedVendorID = vendorID;
     self.connectedProductID = productID;
     self.lastError = nil;
+    USBDisplayLog(@"Connected to VID 0x%04X PID 0x%04X. %@", vendorID, productID, self.statusSummary);
     return YES;
 }
 
 - (void)disconnect {
+    if (self.isConnected) {
+        USBDisplayLog(@"Disconnecting USB device");
+    }
     [self stopStreaming];
     [self closeUSBInterfacesOnStreamQueue];
     self.isConnected = NO;
@@ -161,18 +180,25 @@ static void *USBDisplayStreamerQueueKey = &USBDisplayStreamerQueueKey;
                           fps:(NSUInteger)fps {
     if (!self.isConnected || !_interfaceInterface || _outPipeRef == 0) {
         self.lastError = @"Connect to the ESP USB vendor interface before streaming.";
+        USBDisplayLog(@"%@", self.lastError);
         return NO;
     }
     if (displayID == 0 || width == 0 || height == 0) {
         self.lastError = @"Create the virtual display before streaming.";
+        USBDisplayLog(@"%@", self.lastError);
         return NO;
     }
 
     if (@available(macOS 10.15, *)) {
         if (!CGPreflightScreenCaptureAccess()) {
-            CGRequestScreenCaptureAccess();
+            if (!_screenCaptureAccessRequested) {
+                _screenCaptureAccessRequested = YES;
+                USBDisplayLog(@"Screen Recording permission is not granted. Requesting permission.");
+                CGRequestScreenCaptureAccess();
+            }
             if (!CGPreflightScreenCaptureAccess()) {
                 self.lastError = @"Screen Recording permission is required before capture can start.";
+                USBDisplayLog(@"%@", self.lastError);
                 return NO;
             }
         }
@@ -191,6 +217,8 @@ static void *USBDisplayStreamerQueueKey = &USBDisplayStreamerQueueKey;
 
     self.lastError = nil;
     self.isStreaming = YES;
+    USBDisplayLog(@"Start streaming display %u at %ux%u, JPEG quality %lu, %lu fps", displayID, width, height,
+                  (unsigned long)_jpegQuality, (unsigned long)_fps);
 
     uint64_t intervalNsec = NSEC_PER_SEC / _fps;
     _streamTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _streamQueue);
@@ -209,6 +237,8 @@ static void *USBDisplayStreamerQueueKey = &USBDisplayStreamerQueueKey;
 - (void)stopStreaming {
     _streamGeneration += 1;
     if (_streamTimer) {
+        USBDisplayLog(@"Stop streaming. Frames=%llu bytes=%llu dropped=%u", self.framesSent, self.bytesSent,
+                      self.droppedFrames);
         dispatch_source_cancel(_streamTimer);
         _streamTimer = nil;
     }
@@ -389,11 +419,13 @@ static void *USBDisplayStreamerQueueKey = &USBDisplayStreamerQueueKey;
     _interfaceInterface = candidate;
     _outPipeRef = outPipe;
     _outMaxPacketSize = maxPacketSize;
-    [self readAndParseVendorInterfaceDescriptorFrom:candidate];
+    [self readAndParseVendorInterfaceDescriptorFrom:candidate service:usbInterface];
+    USBDisplayLog(@"Opened vendor interface. OUT pipe=%u maxPacket=%u descriptor=%@", _outPipeRef, _outMaxPacketSize,
+                  self.displayDescriptor ?: @"<none>");
     return YES;
 }
 
-- (void)readAndParseVendorInterfaceDescriptorFrom:(IOUSBInterfaceInterface **)interface {
+- (void)readAndParseVendorInterfaceDescriptorFrom:(IOUSBInterfaceInterface **)interface service:(io_service_t)usbInterface {
     self.displayDescriptor = nil;
     self.displayWidth = 0;
     self.displayHeight = 0;
@@ -401,9 +433,20 @@ static void *USBDisplayStreamerQueueKey = &USBDisplayStreamerQueueKey;
     self.displayMaxFPS = 0;
     self.displayFrameLimit = 0;
 
+    NSString *registryDescriptor = [self registryStringDescriptorFromInterfaceService:usbInterface];
+    if (registryDescriptor.length > 0) {
+        self.displayDescriptor = registryDescriptor;
+        [self parseDisplayDescriptor:registryDescriptor];
+        if (self.displayWidth > 0 && self.displayHeight > 0) {
+            USBDisplayLog(@"Parsed IORegistry descriptor: %@", registryDescriptor);
+            return;
+        }
+    }
+
     UInt8 stringIndex = 0;
     IOReturn kr = (*interface)->USBInterfaceGetStringIndex(interface, &stringIndex);
     if (kr != kIOReturnSuccess || stringIndex == 0) {
+        USBDisplayLog(@"USBInterfaceGetStringIndex failed or returned zero index: 0x%08x", kr);
         return;
     }
 
@@ -412,11 +455,27 @@ static void *USBDisplayStreamerQueueKey = &USBDisplayStreamerQueueKey;
         descriptor = [self stringDescriptorAtIndex:stringIndex languageID:0x0000];
     }
     if (descriptor.length == 0) {
+        USBDisplayLog(@"Failed to read string descriptor at index %u", stringIndex);
         return;
     }
 
     self.displayDescriptor = descriptor;
     [self parseDisplayDescriptor:descriptor];
+    USBDisplayLog(@"Parsed USB string descriptor: %@", descriptor);
+}
+
+- (nullable NSString *)registryStringDescriptorFromInterfaceService:(io_service_t)usbInterface {
+    CFTypeRef value = IORegistryEntryCreateCFProperty(usbInterface, CFSTR("kUSBString"), kCFAllocatorDefault, 0);
+    if (!value) {
+        return nil;
+    }
+
+    NSString *descriptor = nil;
+    if (CFGetTypeID(value) == CFStringGetTypeID()) {
+        descriptor = [(__bridge NSString *)value copy];
+    }
+    CFRelease(value);
+    return descriptor;
 }
 
 - (nullable NSString *)stringDescriptorAtIndex:(UInt8)index languageID:(UInt16)languageID {
@@ -463,6 +522,7 @@ static void *USBDisplayStreamerQueueKey = &USBDisplayStreamerQueueKey;
                                                     options:0
                                                       range:NSMakeRange(0, descriptor.length)];
     if (!match || match.numberOfRanges < 6) {
+        USBDisplayLog(@"Descriptor did not match expected format: %@", descriptor);
         return;
     }
 
@@ -471,6 +531,9 @@ static void *USBDisplayStreamerQueueKey = &USBDisplayStreamerQueueKey;
     self.displayJPEGQuality = (NSUInteger)[[descriptor substringWithRange:[match rangeAtIndex:3]] integerValue];
     self.displayMaxFPS = (NSUInteger)[[descriptor substringWithRange:[match rangeAtIndex:4]] integerValue];
     self.displayFrameLimit = (NSUInteger)[[descriptor substringWithRange:[match rangeAtIndex:5]] integerValue];
+    USBDisplayLog(@"Display mode parsed: %ux%u JPEG=%lu FPS=%lu frameLimit=%lu", self.displayWidth, self.displayHeight,
+                  (unsigned long)self.displayJPEGQuality, (unsigned long)self.displayMaxFPS,
+                  (unsigned long)self.displayFrameLimit);
 }
 
 - (BOOL)findBulkOutPipeOnInterface:(IOUSBInterfaceInterface **)interface
@@ -501,6 +564,7 @@ static void *USBDisplayStreamerQueueKey = &USBDisplayStreamerQueueKey;
         if (direction == kUSBOut && transferType == kUSBBulk) {
             *pipeRef = candidatePipe;
             *maxPacketSize = packetSize;
+            USBDisplayLog(@"Found bulk OUT pipe=%u endpoint=%u maxPacket=%u", candidatePipe, number, packetSize);
             return YES;
         }
     }
@@ -547,6 +611,7 @@ static void *USBDisplayStreamerQueueKey = &USBDisplayStreamerQueueKey;
     if (CGRectIsEmpty(displayBounds)) {
         self.droppedFrames += 1;
         self.lastError = @"Virtual display bounds are empty.";
+        USBDisplayLog(@"%@", self.lastError);
         return;
     }
 
@@ -572,6 +637,7 @@ static void *USBDisplayStreamerQueueKey = &USBDisplayStreamerQueueKey;
                                   if (!retainedImage) {
                                       strongSelf.droppedFrames += 1;
                                       strongSelf.lastError = errorMessage ?: @"ScreenCaptureKit returned no image.";
+                                      USBDisplayLog(@"%@", strongSelf.lastError);
                                       return;
                                   }
 
@@ -586,16 +652,24 @@ static void *USBDisplayStreamerQueueKey = &USBDisplayStreamerQueueKey;
         if (!screenImage) {
             self.droppedFrames += 1;
             self.lastError = @"ScreenCaptureKit returned no image.";
+            USBDisplayLog(@"%@", self.lastError);
             return;
         }
 
-        CGImageRef imageToEncode = screenImage;
+        CGRect displayBounds = CGDisplayBounds(_displayID);
+        CGImageRef cursorImage = [self copyImageByDrawingCursorIfNeeded:screenImage displayBounds:displayBounds];
+        CGImageRef sourceImage = cursorImage ?: screenImage;
+        CGImageRef imageToEncode = sourceImage;
         CGImageRef scaledImage = NULL;
-        if (CGImageGetWidth(screenImage) != _width || CGImageGetHeight(screenImage) != _height) {
-            scaledImage = [self copyImage:screenImage resizedToWidth:_width height:_height];
+        if (CGImageGetWidth(sourceImage) != _width || CGImageGetHeight(sourceImage) != _height) {
+            scaledImage = [self copyImage:sourceImage resizedToWidth:_width height:_height];
             if (!scaledImage) {
+                if (cursorImage) {
+                    CGImageRelease(cursorImage);
+                }
                 self.droppedFrames += 1;
                 self.lastError = @"Failed to scale captured display image.";
+                USBDisplayLog(@"%@", self.lastError);
                 return;
             }
             imageToEncode = scaledImage;
@@ -605,11 +679,15 @@ static void *USBDisplayStreamerQueueKey = &USBDisplayStreamerQueueKey;
         if (scaledImage) {
             CGImageRelease(scaledImage);
         }
+        if (cursorImage) {
+            CGImageRelease(cursorImage);
+        }
 
         if (!jpegData || jpegData.length == 0 || jpegData.length >= (1u << 22)) {
             self.droppedFrames += 1;
             self.lastError = [NSString
                 stringWithFormat:@"JPEG frame is invalid or too large: %lu bytes.", (unsigned long)jpegData.length];
+            USBDisplayLog(@"%@", self.lastError);
             return;
         }
 
@@ -631,10 +709,123 @@ static void *USBDisplayStreamerQueueKey = &USBDisplayStreamerQueueKey;
             self.framesSent += 1;
             self.bytesSent += packet.length;
             self.lastError = nil;
+            if (self.framesSent == 1 || self.framesSent % 60 == 0) {
+                USBDisplayLog(@"Sent frame %llu, packet=%lu bytes, dropped=%u", self.framesSent,
+                              (unsigned long)packet.length, self.droppedFrames);
+            }
         } else {
             self.droppedFrames += 1;
         }
     }
+}
+
+- (CGImageRef)copyImageByDrawingCursorIfNeeded:(CGImageRef)image
+                                 displayBounds:(CGRect)displayBounds CF_RETURNS_RETAINED {
+    if (!image || CGRectIsEmpty(displayBounds)) {
+        return NULL;
+    }
+
+    CGEventRef event = CGEventCreate(NULL);
+    if (!event) {
+        return NULL;
+    }
+    CGPoint mouseLocation = CGEventGetLocation(event);
+    CFRelease(event);
+
+    if (!CGRectContainsPoint(displayBounds, mouseLocation)) {
+        return NULL;
+    }
+
+    CGPoint cursorHotSpot = CGPointZero;
+    CGSize cursorPointSize = CGSizeZero;
+    CGImageRef cursorImage = [self copyCurrentCursorImageWithHotSpot:&cursorHotSpot pointSize:&cursorPointSize];
+    if (!cursorImage) {
+        return NULL;
+    }
+
+    size_t width = CGImageGetWidth(image);
+    size_t height = CGImageGetHeight(image);
+    if (width == 0 || height == 0) {
+        CGImageRelease(cursorImage);
+        return NULL;
+    }
+
+    size_t cursorWidth = CGImageGetWidth(cursorImage);
+    size_t cursorHeight = CGImageGetHeight(cursorImage);
+    CGFloat displayScaleX = (CGFloat)width / displayBounds.size.width;
+    CGFloat displayScaleY = (CGFloat)height / displayBounds.size.height;
+    CGFloat cursorScaleX = cursorPointSize.width > 0 ? (CGFloat)cursorWidth / cursorPointSize.width : 1.0;
+    CGFloat cursorScaleY = cursorPointSize.height > 0 ? (CGFloat)cursorHeight / cursorPointSize.height : 1.0;
+
+    CGFloat cursorTopLeftX =
+        (mouseLocation.x - displayBounds.origin.x) * displayScaleX - cursorHotSpot.x * cursorScaleX;
+    CGFloat cursorTopLeftY =
+        (mouseLocation.y - displayBounds.origin.y) * displayScaleY - cursorHotSpot.y * cursorScaleY;
+    CGRect cursorRect =
+        CGRectMake(cursorTopLeftX, (CGFloat)height - cursorTopLeftY - (CGFloat)cursorHeight, cursorWidth, cursorHeight);
+
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    if (!colorSpace) {
+        CGImageRelease(cursorImage);
+        return NULL;
+    }
+
+    CGContextRef context =
+        CGBitmapContextCreate(NULL, width, height, 8, width * 4, colorSpace,
+                              (CGBitmapInfo)kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(colorSpace);
+    if (!context) {
+        CGImageRelease(cursorImage);
+        return NULL;
+    }
+
+    CGContextDrawImage(context, CGRectMake(0, 0, width, height), image);
+    CGContextDrawImage(context, cursorRect, cursorImage);
+    CGImageRef imageWithCursor = CGBitmapContextCreateImage(context);
+    CGContextRelease(context);
+    CGImageRelease(cursorImage);
+    return imageWithCursor;
+}
+
+- (CGImageRef)copyCurrentCursorImageWithHotSpot:(CGPoint *)hotSpot pointSize:(CGSize *)pointSize CF_RETURNS_RETAINED {
+    __block CGImageRef copiedImage = NULL;
+    __block CGPoint copiedHotSpot = CGPointZero;
+    __block CGSize copiedPointSize = CGSizeZero;
+
+    void (^copyCursorImage)(void) = ^{
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        NSCursor *cursor = NSCursor.currentSystemCursor ?: NSCursor.arrowCursor;
+#pragma clang diagnostic pop
+        NSImage *image = cursor.image;
+        if (!image) {
+            return;
+        }
+
+        NSRect proposedRect = NSMakeRect(0, 0, image.size.width, image.size.height);
+        CGImageRef cgImage = [image CGImageForProposedRect:&proposedRect context:nil hints:nil];
+        if (!cgImage) {
+            return;
+        }
+
+        copiedImage = CGImageRetain(cgImage);
+        copiedHotSpot = CGPointMake(cursor.hotSpot.x, cursor.hotSpot.y);
+        copiedPointSize = CGSizeMake(image.size.width, image.size.height);
+    };
+
+    if (NSThread.isMainThread) {
+        copyCursorImage();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), copyCursorImage);
+    }
+
+    if (hotSpot) {
+        *hotSpot = copiedHotSpot;
+    }
+    if (pointSize) {
+        *pointSize = copiedPointSize;
+    }
+    return copiedImage;
 }
 
 - (CGImageRef)copyImage:(CGImageRef)image resizedToWidth:(size_t)width height:(size_t)height CF_RETURNS_RETAINED {
@@ -684,6 +875,7 @@ static void *USBDisplayStreamerQueueKey = &USBDisplayStreamerQueueKey;
             (*_interfaceInterface)->WritePipe(_interfaceInterface, _outPipeRef, (void *)(bytes + offset), chunkSize);
         if (kr != kIOReturnSuccess) {
             self.lastError = [self message:@"WritePipe failed" result:kr];
+            USBDisplayLog(@"%@", self.lastError);
             return NO;
         }
         offset += chunkSize;

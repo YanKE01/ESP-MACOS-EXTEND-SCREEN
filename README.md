@@ -10,7 +10,7 @@ The protocol follows the ESP example:
 /Users/linke/project/esp-iot-solution/examples/usb/device/usb_extend_screen
 ```
 
-The current implementation has not been fully tested with real hardware yet. Without the device, only virtual display creation, UI state, and builds have been verified.
+The basic display path has been verified with an ESP USB device running the `usb_extend_screen` firmware.
 
 ## Behavior
 
@@ -30,6 +30,34 @@ The current implementation has not been fully tested with real hardware yet. Wit
 - It sends `JPG` frames using the ESP `usb_extend_screen` packet format.
 
 In the normal path, users do not need to choose a resolution manually. `Width`, `Height`, `FPS`, and `JPEG` in the UI are for Debug and manual testing. Auto mode overwrites them with values parsed from the USB descriptor.
+
+## Technical Route
+
+The project follows a device-descriptor-driven virtual display route. The ESP firmware declares the display mode, the macOS app creates a real system extended display, captures that display, encodes each frame, and sends it to the ESP device through a USB vendor endpoint.
+
+```text
+ESP USB device
+  -> TinyUSB vendor interface
+  -> interface string: R<width>x<height>_Ejpg<quality>_Fps<fps>_Bl<limit>
+  -> macOS app parses mode
+  -> CGVirtualDisplay creates an extended display
+  -> ScreenCaptureKit captures that display
+  -> cursor overlay is drawn in software
+  -> ImageIO encodes JPEG
+  -> USB bulk OUT sends header + JPEG payload
+  -> ESP app_vendor receives frames
+  -> ESP LCD task draws the JPEG frame
+```
+
+Key design choices:
+
+- **The device chooses the resolution**: the app does not ask the user to pick a mode. It reads the vendor interface string descriptor. For example, a device may expose `<target>udisp0_R800x480_Ejpg6_Fps60_Bl300000`; the app only uses the `R...` mode segment to parse the resolution, JPEG quality, FPS, and frame limit.
+- **macOS creates a real extended display**: `CGVirtualDisplay` creates `ESP USB Virtual Display`, which appears in System Settings and behaves like a normal extended display for window placement and mouse movement.
+- **Capture and transport stay separated**: the virtual display receives normal system rendering, while the USB streamer only captures the display rectangle, encodes it, and sends packets. The USB protocol does not need to know about windows, layers, or AppKit rendering.
+- **JPEG first**: the current stream uses `UDISP_TYPE_JPG`, which is already supported by the ESP example and avoids the bandwidth cost of raw RGB frames.
+- **Cursor is overlaid in software**: `SCScreenshotManager captureImageInRect` captures screen pixels but does not reliably include the cursor. The macOS app checks whether `CGEventGetLocation` is inside the virtual display bounds, then draws the current `NSCursor` image at its hotspot before JPEG encoding.
+- **Auto mode closes the loop**: the app scans VID/PID every second, opens the USB device, parses the descriptor, creates the virtual display, and starts streaming. Debug controls are kept for manual diagnosis.
+- **Permissions and signing are macOS constraints**: screen capture requires Screen Recording permission. An ad-hoc signed Debug app may ask for permission again after rebuilds because the executable hash changes. For stable testing, reuse the same build or configure a stable signing identity.
 
 ## Implementation
 
@@ -58,8 +86,9 @@ Responsibilities:
   - Matches USB devices with IOKit
   - Opens the vendor interface
   - Finds the bulk OUT pipe
-  - Reads and parses the interface string descriptor
+  - Reads and parses the display descriptor from IORegistry or USB string descriptors
   - Captures the virtual display with ScreenCaptureKit
+  - Draws the cursor overlay into the captured frame
   - Encodes JPEG with ImageIO
   - Writes packets to the ESP device over USB bulk OUT
 
@@ -228,13 +257,28 @@ uint32_t payload_total: 22;
 
 The macOS app concatenates the header and JPEG payload, then writes the packet to the bulk OUT pipe in 16 KB chunks.
 
+## Packaging a Test DMG
+
+For local or GitHub Release testing without an Apple Developer account:
+
+```bash
+scripts/package_unsigned_dmg.sh
+```
+
+The script builds the Release app, applies an ad-hoc signature, and creates:
+
+```text
+dist/ESP_USB_Display_unsigned.dmg
+```
+
+This DMG is not notarized. Users will still need to bypass the "unidentified developer" Gatekeeper prompt and grant Screen Recording permission on first run.
+
 ## Known Limits
 
-- Real ESP USB display hardware has not been tested yet.
 - `CGVirtualDisplay` is a private macOS API and may break across macOS releases.
 - The current capture path is screenshot-style capture, not a low-latency stream. Higher FPS use cases may need `SCStream`.
 - Only JPEG frames are sent. RGB565, RGB888, and YUV420 are not implemented.
-- Touch, HID, and audio are not implemented.
+- The display path does not handle touch, HID, or audio. The firmware may enumerate HID touch/UAC audio at the same time, but the macOS app currently only uses the vendor display interface.
 - The app does not proactively enforce the `Bl` frame limit before sending. If the JPEG payload exceeds `CONFIG_USB_EXTEND_SCREEN_FRAME_LIMIT_B`, the ESP firmware will drop the frame. Lower resolution or JPEG quality first when debugging this.
 - CRC is currently sent as `0`.
 - Hotplug handling uses 1-second polling instead of IOKit notifications.
@@ -252,6 +296,14 @@ If the macOS virtual display appears but the device does not show an image:
   - `Drop frame with unexpected area`
   - `Drop frame: payload_total`
   - `payload overflow`
+
+If the user denied Screen Recording permission, or removed it later in System Settings, reset the TCC record for this app:
+
+```bash
+tccutil reset ScreenCapture linke.extend-screen
+```
+
+Then quit the app completely, open it again, and start capture/Auto mode once more. macOS only shows the permission prompt when the app calls the screen capture API again.
 
 If you manually click `Start Display` in Debug:
 

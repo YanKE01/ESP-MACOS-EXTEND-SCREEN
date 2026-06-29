@@ -8,7 +8,7 @@
 /Users/linke/project/esp-iot-solution/examples/usb/device/usb_extend_screen
 ```
 
-当前实现还没有在真实硬件上完整验证；没有设备时，只能验证 macOS 虚拟屏创建、UI 状态和编译。
+当前实现已经在运行 `usb_extend_screen` firmware 的 ESP USB 设备上跑通基础显示链路。
 
 ## 当前行为
 
@@ -28,6 +28,34 @@
 - 按 ESP `usb_extend_screen` 的 packet header 格式发送 `JPG` 帧。
 
 正常使用时不需要手动设置分辨率。界面里的 `Width` / `Height` / `FPS` / `JPEG` 是 Debug 和手动测试用的；Auto 模式下会被设备 descriptor 覆盖。
+
+## 技术路线
+
+整体路线是“设备描述符驱动的 macOS 虚拟扩展屏”。ESP 固件负责声明自己是什么屏，macOS app 负责创建一个真实可用的系统扩展屏，再把这个扩展屏的画面编码后通过 USB vendor endpoint 发给 ESP。
+
+```text
+ESP USB device
+  -> TinyUSB vendor interface
+  -> interface string: R<width>x<height>_Ejpg<quality>_Fps<fps>_Bl<limit>
+  -> macOS app parses mode
+  -> CGVirtualDisplay creates an extended display
+  -> ScreenCaptureKit captures that display
+  -> cursor overlay is drawn in software
+  -> ImageIO encodes JPEG
+  -> USB bulk OUT sends header + JPEG payload
+  -> ESP app_vendor receives frames
+  -> ESP LCD task draws the JPEG frame
+```
+
+关键设计点：
+
+- **分辨率由设备决定**：app 不要求用户手动选择分辨率，而是读取 vendor interface string descriptor。例如设备可以暴露 `<target>udisp0_R800x480_Ejpg6_Fps60_Bl300000` 这类字符串，macOS 端只关心其中的 `R...` 模式段，用它解析分辨率、JPEG 质量、FPS 和单帧大小上限。
+- **macOS 侧创建真正的扩展屏**：通过 `CGVirtualDisplay` 创建 `ESP USB Virtual Display`，系统设置里能看到它，也可以像普通扩展屏一样排列位置、拖窗口、移动鼠标。
+- **画面采集和传输解耦**：虚拟屏负责接收系统渲染，USB streamer 只负责采集这块屏幕、编码、发包。这样 USB 协议不需要理解窗口、图层或 AppKit 细节。
+- **JPEG 优先**：当前协议只发送 ESP 示例工程已经支持的 `UDISP_TYPE_JPG`，避免 raw RGB 带宽过大，也方便直接复用设备端 `app_vendor.c` 的接收逻辑。
+- **cursor 软件叠加**：`SCScreenshotManager captureImageInRect` 抓到的是屏幕内容，不一定包含鼠标指针；macOS 端会根据 `CGEventGetLocation` 判断鼠标是否在虚拟屏上，然后把 `NSCursor` 图像按 hotspot 画进 JPEG 前的帧里。
+- **Auto 模式做最短闭环**：app 每秒扫描 VID/PID，连接后读取 descriptor，自动创建虚拟屏并开始 stream。Debug 区只作为手动排查入口。
+- **权限和签名是 macOS 约束**：屏幕采集需要 Screen Recording 权限。ad-hoc 签名的 Debug app 可能因为每次 build 后 hash 变化而反复要求授权；稳定测试时应尽量复用同一个 build，或者配置稳定签名。
 
 ## macOS 端实现
 
@@ -56,8 +84,9 @@ extend_screen/VirtualDisplayBridge.h
   - 使用 IOKit 匹配 USB 设备
   - 打开 vendor interface
   - 查找 bulk OUT pipe
-  - 读取并解析 interface string descriptor
+  - 从 IORegistry/USB string descriptor 读取并解析 display descriptor
   - 使用 ScreenCaptureKit 截屏
+  - 将鼠标指针叠加到虚拟屏帧上
   - 使用 ImageIO 编码 JPEG
   - 通过 USB bulk OUT 写入 ESP 设备
 
@@ -228,13 +257,28 @@ uint32_t payload_total: 22;
 
 macOS 端会把 header 和 JPEG payload 拼成一个 packet，再按 16 KB chunk 写入 bulk OUT pipe。
 
+## 打包测试 DMG
+
+如果只是本地测试或上传到 GitHub Release，且没有 Apple Developer 账号，可以运行：
+
+```bash
+scripts/package_unsigned_dmg.sh
+```
+
+脚本会构建 Release app、做 ad-hoc 签名，并生成：
+
+```text
+dist/ESP_USB_Display_unsigned.dmg
+```
+
+这个 DMG 没有 notarize。用户第一次运行时仍然需要绕过“无法验证开发者”的 Gatekeeper 提示，并手动授予 Screen Recording 权限。
+
 ## 已知限制
 
-- 还没有真实 ESP USB 屏硬件验证。
 - 当前使用 `CGVirtualDisplay` private API，macOS 版本变化可能导致不可用。
 - 当前采集路径是 screenshot-style capture，不是低延迟视频流；高 FPS 场景后面可能需要改成 `SCStream`。
 - 当前只发送 JPEG，不支持 RGB565/RGB888/YUV420。
-- 当前没有实现 touch/HID/audio。
+- 当前显示链路不处理 touch/HID/audio；固件可以同时枚举 HID touch/UAC audio，但 macOS app 目前只使用 vendor display interface。
 - 当前没有严格按 `Bl` 提前限制 JPEG payload 大小；如果 JPEG 大于 ESP firmware 的 `CONFIG_USB_EXTEND_SCREEN_FRAME_LIMIT_B`，ESP 端会丢帧。可以先降低分辨率或 JPEG 质量排查。
 - 当前 CRC 填 `0`，未做校验。
 - 当前热插拔是 1 秒轮询，不是 IOKit notification。
@@ -252,6 +296,14 @@ macOS 端会把 header 和 JPEG payload 拼成一个 packet，再按 16 KB chunk
   - `Drop frame with unexpected area`
   - `Drop frame: payload_total`
   - `payload overflow`
+
+如果用户第一次点了拒绝，或者后来在系统设置里取消了 Screen Recording 权限，可以清掉这个 app 的 TCC 记录：
+
+```bash
+tccutil reset ScreenCapture linke.extend-screen
+```
+
+然后完全退出 app，重新打开，再触发一次采集或 Auto 模式。macOS 只会在 app 再次调用屏幕采集 API 时重新弹授权窗口。
 
 如果 Debug 里手动点 `Start Display`：
 
